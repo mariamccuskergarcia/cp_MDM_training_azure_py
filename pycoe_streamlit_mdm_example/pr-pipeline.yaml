@@ -1,0 +1,38 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+name: $(TeamProject)_$(Build.DefinitionName)_$(SourceBranchName)_$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger: none
+
+
+pool:
+  vmImage: windows-latest
+
+steps:
+- checkout: self
+  displayName: 'Get the content of this git repo'
+
+- task: UsePythonVersion@0
+  displayName: 'Use Python version 3.10'
+  inputs:
+    versionSpec: '3.10'
+
+- script: |
+    python -m pip install -U pip
+    pip install poetry
+    poetry install
+  displayName: install dependencies 
+
+- script: |
+    poetry run pytest --junitxml=TEST-shiftleft.xml 
+  workingDirectory: tests/ci
+  displayName: 'Run the ci test and save results'
+
+- task: PublishTestResults@2
+  displayName: 'Publish the ci test results'
+  inputs:
+    testResultsFormat: 'JUnit'
+    testResultsFiles: '**/TEST-*.xml'
+    failTaskOnFailedTests: true

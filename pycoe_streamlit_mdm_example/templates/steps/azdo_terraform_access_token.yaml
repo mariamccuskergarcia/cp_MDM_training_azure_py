@@ -1,0 +1,16 @@
+parameters:
+  - name: "Folder"
+    type: string
+
+steps:
+  - pwsh: |
+      $tfmodules = Get-ChildItem "${{Parameters.Folder}}" -Recurse -Filter "*.tf"
+
+          foreach ($tfmodule in $tfmodules) {
+            $content = [System.IO.File]::ReadAllText($tfmodule.FullName).Replace("git::https://kubrick-training@", 
+            "git::https://$($env:SYSTEM_ACCESSTOKEN)@")
+            [System.IO.File]::WriteAllText($tfmodule.FullName, $content)
+          }
+    env:
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+    displayName: Add Access token to Git URL

@@ -1,0 +1,8 @@
+steps:
+  - task: CmdLine@2
+    displayName: "tag repo in git"
+    inputs:
+      script: |
+        git tag $(Build.BuildNumber)
+        git push origin $(Build.BuildNumber)
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))

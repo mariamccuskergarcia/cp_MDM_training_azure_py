@@ -1,0 +1,256 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+name: $(TeamProject)_$(Build.DefinitionName)_$(SourceBranchName)_$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  - main
+
+resources:
+  repositories:
+    - repository: tf
+      type: git
+      name: ce06/mdm_training_tool_cloud_repo
+
+parameters:
+  - name: PythonVersion
+    type: string
+    values:
+      - 3.9
+      - 3.10
+      - 3.11
+    default: 3.11
+
+  - name: terraformVersion
+    displayName: Terraform version
+    type: string
+    values:
+      - 1.2.8
+      - 1.2.9
+      - 1.3.0
+      - 1.8.0
+    default: 1.8.0
+
+variables:
+  - name: Source.Zip
+    value: "webapp_$(Build.BuildId).zip"
+  - name: Stage.Statefile
+    value: "ce06_mdm_training_tool_cloud_repo_CICD_dev_state.tfstate"
+  - name: Temp.Archive
+    value: "$(Build.SourcesDirectory)/tempForArchive"
+
+stages:
+  - stage: build
+    displayName: Build and publish code
+    pool:
+      vmImage: windows-latest
+    jobs:
+      - job: shift_left
+        displayName: Run the shift left test
+        steps:
+          - checkout: self
+            displayName: "Get the content of this git repo"
+
+          - task: UsePythonVersion@0
+            displayName: "Use Python version 3.10"
+            inputs:
+              versionSpec: "3.10"
+
+          - script: |
+              python -m pip install -U pip
+              pip install poetry
+              poetry install
+            displayName: install dependencies
+
+          - script: |
+              poetry run pytest --junitxml=TEST-shiftleft.xml
+            workingDirectory: tests/ci
+            displayName: "Run the ci test and save results"
+
+          - task: PublishTestResults@2
+            displayName: "Publish Test Results **/TEST-**.xml"
+            inputs:
+              searchFolder: tests/ci
+              failTaskOnFailedTests: true
+            condition: always()
+
+      - job: artifact
+        displayName: Publish artifacts
+        dependsOn: shift_left
+        steps:
+          - checkout: self
+            persistCredentials: true
+
+          - task: UsePythonVersion@0
+            displayName: "Use Python version 3.10"
+            inputs:
+              versionSpec: "3.10"
+
+          - script: |
+              python -m pip install -U pip
+              pip install poetry
+              poetry install
+              poetry export -f requirements.txt --output requirements.txt --without-hashes
+            displayName: install dependencies
+
+          - powershell: |
+              New-Item -ItemType Directory -Path "$(Temp.Archive)" -Force
+            displayName: "Making the temp directory"
+
+          - task: CopyFiles@2
+            displayName: "Copy the web app files to: $(Temp.Archive)"
+            inputs:
+              Contents: |
+                **/*
+                *.txt
+                !**/.git/**
+                !**/tests/**
+                !*.md
+                !*.yaml 
+                !*.toml
+              TargetFolder: "$(Temp.Archive)"
+
+          - task: ArchiveFiles@2
+            displayName: Archive application files
+            inputs:
+              rootFolderOrFile: "$(Temp.Archive)"
+              includeRootFolder: false
+              archieveType: "zip"
+              archiveFile: "$(Build.ArtifactStagingDirectory)/$(Source.Zip)"
+              replaceExistingArchive: true
+
+          - task: DeleteFiles@1
+            displayName: Delete the temp files used to building the web app zip
+            inputs:
+              SourceFolder: "$(Temp.Archive)"
+
+          # Copying the files from our CI test folder into a staging area
+          - task: CopyFiles@2
+            displayName: "Copy files to: $(Build.ArtifactStagingDirectory)"
+            inputs:
+              Contents: "**/tests/ci/**"
+              TargetFolder: "$(Build.ArtifactStagingDirectory)"
+
+          # Copying the files from our UX test folder into a staging area
+          - task: CopyFiles@2
+            displayName: "Copy UX test files to: $(Build.ArtifactStagingDirectory)"
+            inputs:
+              Contents: "**tests/ux/**"
+              TargetFolder: "$(Build.ArtifactStagingDirectory)"
+
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish Artifact: drop"
+
+          # Calling this template, it runs a git tag
+          - template: templates/steps/azdo_git_tag.yaml
+
+  - stage: dev
+    dependsOn: build
+    displayName: Deploy to dev
+    variables:
+      - group: ce06-Azure-Terraform-dev
+    pool:
+      vmImage: windows-latest
+    jobs:
+      - job: terraform
+        displayName: Terraform Outputs For Dev
+        steps:
+          - checkout: tf
+            path: iac
+            persistCredentials: true
+
+          - template: templates/steps/azdo_terraform_access_token.yaml
+            parameters:
+              Folder: $(Pipeline.Workspace)
+
+          - task: ms-devlabs.custom-terraform-tasks.custom-terraform-installer-task.TerraformInstaller@0
+            inputs:
+              terraformVersion: 1.8.0
+
+          - task: TerraformTaskV4@4
+            displayName: Terraform Init
+            inputs:
+              provider: "azurerm"
+              command: "init"
+              workingDirectory: $(Pipeline.Workspace)/iac
+              backendServiceArm: ce06-Azure-Terraform-dev
+              backendAzureRmResourceGroupName: $(Tf.ResourceGroup)
+              backendAzureRmStorageAccountName: $(Tf.StorageAccount)
+              backendAzureRmContainerName: $(Tf.StorageContainer)
+              backendAzureRmKey: $(Stage.Statefile)
+
+          - task: terraform-outputs@0
+            displayName: Setting terraform outputs
+            inputs:
+              workingDirectory: $(Pipeline.Workspace)/iac
+              mapSensitiveOutputsAsSecrets: true
+              variablePrefix: Azure.tf.
+
+          - script: |
+              echo ##vso[task.setvariable variable=web_app_name;isOutput=true]$(Azure.tf.web_app_name)
+              echo ##vso[task.setvariable variable=resource_group_name;isOutput=true]$(Azure.tf.resource_group_name)
+              echo ##vso[task.setvariable variable=slot_name;isOutput=true]$(Azure.tf.slot_name)
+            name: outputs
+            displayName: Export the terraform outputs for web app details
+
+      - job: deploy_dev
+        displayName: Deploy to dev
+        dependsOn: terraform
+        variables:
+          web_app_name: $[dependencies.terraform.outputs['outputs.web_app_name']]
+          resource_group_name: $[dependencies.terraform.outputs['outputs.resource_group_name']]
+          slot_name: $[dependencies.terraform.outputs['outputs.slot_name']]
+        steps:
+          - checkout: none
+            persistCredentials: true
+
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              buildType: current
+              artifactName: drop
+              TargetFolder: $(Pipeline.Workspace)
+
+          - task: CmdLine@2
+            displayName: Show me the environment
+            inputs:
+              script: |
+                echo I am $(System.StageName)
+                echo I will deploy to $(web_app_name)
+                echo I will use $(slot_name)
+
+          - task: AzureWebApp@1
+            inputs:
+              azureSubscription: "ce06-Azure-Terraform-dev"
+              appType: webApp
+              appName: "$(web_app_name)"
+              deployToSlotOrASE: true
+              resourceGroupName: "$(resource_group_name)"
+              slotName: "$(slot_name)"
+              appSettings: "-SCM_DO_BUILD_DURING_DEPLOYMENT true -SCM_TRACE_LEVEL 4 -ENABLE_ORYX_BUILD true"
+              deploymentMethod: zipDeploy
+              package: "$(Pipeline.Workspace)/$(Source.Zip)"
+
+  - stage: prod
+    dependsOn: dev
+    variables:
+      web_app_name: $[stageDependencies.dev.terraform.outputs['outputs.web_app_name']]
+      resource_group_name: $[stageDependencies.dev.terraform.outputs['outputs.resource_group_name']]
+      slot_name: $[stageDependencies.dev.terraform.outputs['outputs.slot_name']]
+    jobs:
+      - deployment: change_slots
+        displayName: Move Dev to Production
+        environment:
+          name: "ce06-Azure-mdm-prod"
+
+      - job: swap
+        displayName: Swap slot with prod
+        steps:
+          - task: AzureAppServiceManage@0
+            inputs:
+              azureSubscription: "ce06-Azure-Terraform-prod"
+              appType: webApp
+              WebAppName: "$(web_app_name)"
+              ResourceGroupName: "$(resource_group_name)"
+              SourceSlot: "$(slot_name)"
+              SwapWithProduction: true
